@@ -4,7 +4,9 @@ Keep unsent chat drafts in the sidebar.
 
 Type something in a new session, then go look at another conversation — natively that session is treated as blank and hidden. This plugin keeps it as a **Pending** entry in the sidebar instead. Click it to keep writing; send it and it becomes a normal conversation.
 
-![Pending entry](docs/pending-row.png)
+![Pending entry](docs/image-3.png)
+
+![Pending banner](docs/image-2.png)
 
 ## What you can do with a pending entry
 
