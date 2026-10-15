@@ -288,14 +288,18 @@ const ctx = {
 // （HMR 重挂载），且 IndexedDB 连接复用。但测试要模拟「进程重启」，得让新实例真的
 // 从头跑起来 —— 通过插件自带的测试钩子 __dpsResetRuntime 复位，只影响测试沙箱。
 const code = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+// 告警里必须能对上当前 BUILD：从源码里直接抽，省得每次升版都手动改断言（漏了就假绿）
+const BUILD = (code.match(/var BUILD = "([^"]+)"/) || [])[1];
 
 let lastSandbox = null;
 let simFetchImpl = null;
-function loadPlugin() {
+function loadPlugin(globals) {
   let spec = null;
   const sandbox = {
     window: { __ModuleLoader__: { load: (s) => { spec = s; } }, addEventListener: () => {} },
     console: simConsole, React, primitives, indexedDB: globalThis.indexedDB, localStorage: globalThis.localStorage,
+    // 默认沙箱没有 DOM（显式写出来，免得将来 Node 全局加了个 document 让样式路径悄悄变样）
+    document: undefined,
     File: class File { constructor(bits, name, opts) { this.bits = bits; this.name = name; this.type = opts?.type || ''; this.size = bits[0]?.length || 0; } arrayBuffer() { return Promise.resolve(this.bits[0] ?? new Uint8Array(0)); } },
     Blob: class Blob { constructor(bits, opts) { this.bits = bits; this.type = opts?.type || ''; this.size = bits[0]?.length || 0; } },
     setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
@@ -329,9 +333,18 @@ function loadPlugin() {
   });
   lastSandbox = sandbox;
   sandbox.globalThis = sandbox;
+  // 可选注入的沙箱全局（例如 document）：必须在 vm.createContext 之前落进去
+  if (globals !== undefined) Object.assign(sandbox, globals);
   vm.createContext(sandbox);
   vm.runInContext(code, sandbox, { filename: 'client.js' });
-  const plugin = spec.factory((name) => (name === 'react' ? React : name === '@deepseek-ai/dsh-client-ui-primitives' ? primitives : name === '@deepseek-ai/dsh-client-store' ? { createSnapshotStore } : undefined));
+  const plugin = spec.factory((name) => {
+    if (name === 'react') return React;
+    if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
+    // F1 之后插件不再 require 基座外的模块：一旦有人加回来，这条会当场炸出来
+    // （官方规范：基座外的请求必须写进 dsh.client.external，否则某些版本直接抛
+    //  "missed the module table"，整个插件静默失效）
+    throw new Error(`sim: 插件 require 了基座外的模块 ${name}（应就地实现或写进 dsh.client.external）`);
+  });
   return plugin;
 }
 
@@ -430,7 +443,7 @@ const entriesStress = registryEntries();
 assert(entriesStress[B1] !== undefined && entriesStress[D] !== undefined, '连续列表变更后两个待执行条目都存活（无递归误删）');
 
 // 重命名：走对话框注册的真实动词，验证写入注册表 + 名称账本
-const renameVerb = slotVerb('pending-rename-dialog', 'commitRename');
+const renameVerb = slotVerb('dps.pending-rename-dialog', 'commitRename');
 assert(typeof renameVerb === 'function', '重命名动词可从插槽注册取得');
 await renameVerb(B1, '我的待办');
 const entriesRenamed = registryEntries();
@@ -714,8 +727,8 @@ assert(entriesLedger[Y] !== undefined && entriesLedger[Y].name === '我的自定
 assert(patchedRows()[Y] !== undefined && patchedRows()[Y].title === '我的自定义名', '侧边栏显示恢复后的自定义名字');
 
 // 删除待执行 → 先弹确认框，确认后走「会话归档管理」插件的物理删除接口
-const deleteVerb = slotVerb('pending-banner', 'deletePending');
-const commitDelete = slotVerb('delete-session-dialog', 'commitDelete');
+const deleteVerb = slotVerb('dps.pending-banner', 'deletePending');
+const commitDelete = slotVerb('dps.delete-session-dialog', 'commitDelete');
 assert(typeof deleteVerb === 'function', '删除按钮动词可从插槽注册取得');
 assert(typeof commitDelete === 'function', '删除确认动词可从插槽注册取得');
 const Z = await sessions.create({ workspaceId: 'w1' });
@@ -752,7 +765,7 @@ const saveLogs = JSON.parse(localStorage.getItem('dsh.pending-session.journal.v1
 assert(saveLogs.length > 0 && saveLogs.every((e) => e.ids === undefined && typeof e.count === 'number'), 'm4：saveRegistry 的 journal 只记 count');
 
 // P1-④：附件字节在 aid 重映射后要丢掉旧 key（否则每次打开待执行都复制一份）
-const restoreVerb = slotVerb('pending-banner', 'restorePending');
+const restoreVerb = slotVerb('dps.pending-banner', 'restorePending');
 const G = await sessions.create({ workspaceId: 'w1' });
 rows[G].cwd = 'C:/ws'; rows[G].blank = true; rows[G].updatedAt = Date.now();
 mainId = G; publishList();
@@ -892,7 +905,7 @@ await new Promise((r) => setTimeout(r, 30));
 const oAfter = registryEntries()[O];
 assert(oAfter !== undefined && oAfter.attachments.length === 1 && oAfter.attachments[0].missing === true, '恢复时跳过 missing 项并原样保留占位');
 // 横幅上多一行提示（渲染真实组件，用假 t 把 {n} 替换出来）
-const bannerReg = slotComponent('pending-banner');
+const bannerReg = slotComponent('dps.pending-banner');
 const bannerState = bannerReg.props.hooks.pending;
 const bannerDict = { 'banner.oversize': '⚠️ 有 {n} 个附件过大未保存' };
 const bannerEl = bannerReg.component(Object.assign({}, bannerReg.props, {
@@ -1179,9 +1192,47 @@ assert(deleteCallsN === 1, '普通会话走自家删除器（只请求一次）'
 assert(outcomeN !== undefined && outcomeN.deleted === false, '普通会话 not-found 不算成功（P0-②）');
 assert(outcomeN.reason === 'no-storage', '普通会话 not-found 返回 no-storage 原因码');
 
+// 悬空引用（存储被外部删掉、workspace 记账还留着 → 界面上那行删不掉、点开报 ENOENT）：
+// 宿主摘掉记账并回 prunedStale:true，客户端必须跟着把它从界面清掉
+const GHOST = await sessions.create({ workspaceId: 'w1' });
+rows[GHOST].cwd = 'C:/ws'; rows[GHOST].blank = false; rows[GHOST].updatedAt = Date.now();
+mainId = C; publishList();
+let ghostBody = null;
+lastSandbox.fetch = async (url, init) => {
+  ghostBody = JSON.parse(init.body);
+  return { ok: true, status: 200, json: async () => ({ results: [{ id: GHOST, status: 'skipped', reason: 'not-found', prunedStale: true }], freedBytes: 0 }) };
+};
+const outcomeGhost = await commitDelete(GHOST);
+await new Promise((r) => setTimeout(r, 30));
+assert(ghostBody !== null && ghostBody.pruneStale === true, '删除请求带上 pruneStale（授权宿主清理悬空记账）');
+assert(outcomeGhost !== undefined && outcomeGhost.deleted === true, '悬空引用被摘掉后视为删除成功（行能真正消失）');
+assert(patchedRows()[GHOST] === undefined, '被摘掉的那行不再出现在侧边栏投影里');
+const journalGhost = JSON.parse(localStorage.getItem('dsh.pending-session.journal.v1') || '[]');
+assert(journalGhost.some((e) => e.op === 'delete-stale-pruned' && e.id === GHOST), 'journal 记下 delete-stale-pruned（便于事后取证）');
+
+// journal 写放大修复：普通对话里镜像处理器每次状态变化都会走到「非空白」分支，
+// 以前每键记一次 skip-non-blank（实测把 300 条环形容量挤满、冲掉真正的增删记录），
+// 现在同一个会话只记首次；换会话重新开始镜像时复位（每个会话各能记一条）
+const NB1 = await sessions.create({ workspaceId: 'w1' });
+rows[NB1].cwd = 'C:/ws'; rows[NB1].blank = false; rows[NB1].updatedAt = Date.now();
+mainId = C; publishList();
+mainId = NB1; publishList(); // 进入非空白会话 → 开始镜像
+for (let i = 0; i < 4; i += 1) {
+  shellFor(NB1).state.set({ draft: '普通会话里打字 ' + i, attachmentIds: [] }); // 模拟连续击键
+}
+const skipOf = (sid) => JSON.parse(localStorage.getItem('dsh.pending-session.journal.v1') || '[]')
+  .filter((e) => e.op === 'skip-non-blank' && e.id === sid).length;
+assert(skipOf(NB1) === 1, 'journal：非空白会话反复变化（模拟击键）只记一条 skip-non-blank');
+
+const NB2 = await sessions.create({ workspaceId: 'w1' });
+rows[NB2].cwd = 'C:/ws'; rows[NB2].blank = false; rows[NB2].updatedAt = Date.now();
+mainId = C; publishList();
+mainId = NB2; publishList(); // 换会话 → 复位
+shellFor(NB2).state.set({ draft: '另一个普通会话里打字', attachmentIds: [] });
+assert(skipOf(NB2) === 1 && skipOf(NB1) === 1, 'journal：换到另一个非空白会话后仍各记一条（记忆位按会话复位）');
+
 // P0-③：非空白会话不会被登记为待执行（普通会话带草稿离开也不行）
-const M = await sessions.create({ workspaceId: 'w1' });
-rows[M].cwd = 'C:/ws'; rows[M].blank = false; rows[M].updatedAt = Date.now();
+const M = await sessions.create({ workspaceId: 'w1' });rows[M].cwd = 'C:/ws'; rows[M].blank = false; rows[M].updatedAt = Date.now();
 mainId = M; publishList();
 shellFor(M).state.set({ draft: '普通会话里的草稿', attachmentIds: [] });
 mainId = C; publishList();
@@ -1271,7 +1322,7 @@ publishList();
 sessions.binding = bindingStub;
 const hostBlankWarns = simWarns.filter((args) => String(args[0]).includes(' hostBlank: '));
 assert(hostBlankWarns.length === 1, 'M4：hostBlank 读取失败只告警一次（不刷屏）');
-assert(String(hostBlankWarns[0]?.[0] || '').includes('0.1.0-r28'), 'M4：告警带上 BUILD 版本号');
+assert(String(hostBlankWarns[0]?.[0] || '').includes(BUILD), 'M4：告警带上 BUILD 版本号');
 
 // M5：dispose（卸载/HMR）之后旧实例必须停手 —— 延迟续跑短路、不再动宿主
 const disposePlugin = simEffects.pop();
@@ -1300,7 +1351,7 @@ const slotWarns = simWarns.filter((args) => String(args[0]).includes(' slot:'));
 assert(slotInjectCalls === 5, '轻微：5 个插槽注册逐个尝试（失败也要一个个试）');
 assert(slotWarns.length === 4, '轻微：每个插槽首次失败各告警一次（shell.overlay 两次注册共用一个 key）');
 assert(slotWarns.some((args) => String(args[0]).includes('slot:conversation.input.dock')), '轻微：告警带上插槽 id');
-assert(slotWarns.every((args) => String(args[0]).includes('0.1.0-r28')), '轻微：插槽告警带 BUILD 版本号');
+assert(slotWarns.every((args) => String(args[0]).includes(BUILD)), '轻微：插槽告警带 BUILD 版本号');
 // 插槽挂不上也不影响状态机：条目照常登记
 const IS = await sessions.create({ workspaceId: 'w1' });
 rows[IS].cwd = 'C:/ws'; rows[IS].blank = true; rows[IS].updatedAt = Date.now();
@@ -1313,8 +1364,8 @@ assert(registryEntries()[IS] !== undefined, '轻微：插槽注册失败不影�
 // 上面那个实例插槽全失败（也就没有对话框注册），这里重新挂一个实例来取动词。
 const plugin5b = loadPlugin();
 plugin5b.apply(ctx);
-const deleteVerb5 = slotVerb('pending-banner', 'deletePending');
-const commitDelete5 = slotVerb('delete-session-dialog', 'commitDelete');
+const deleteVerb5 = slotVerb('dps.pending-banner', 'deletePending');
+const commitDelete5 = slotVerb('dps.delete-session-dialog', 'commitDelete');
 idbFault.delete = true;
 simWarns.length = 0;
 const D1 = await sessions.create({ workspaceId: 'w1' });
@@ -1368,6 +1419,68 @@ disposers6[disposers6.length - 1](); // 旧实例（plugin6）卸载
 publishList();
 assert(patchedRows()[HM] !== undefined && patchedRows()[HM].blank === false, '轻微：旧实例 dispose 不拆掉新实例的投影（HM 行仍是投影后的样子）');
 assert(sessions.list.getSnapshot() === sessions.list.getSnapshot(), '轻微：还原被跳过后投影仍然是稳定引用（React 不炸）');
+
+/** 取最近一个实例登记在册的清理函数（dispose）。 */
+function lastDisposer() { return simEffects[simEffects.length - 1]; }
+
+// 轻微（A3）：插槽 id 必须带包名前缀 —— 官方插槽契约写明「复用同名 id 会顶掉那一格」，
+// 通用词（delete-session / pending-banner 之类）会被 DSH 新版本或第三方插件静默互相顶掉。
+const DPS_IDS = ['dps.pending-banner', 'dps.pending-mark', 'dps.delete-session', 'dps.pending-rename-dialog', 'dps.delete-session-dialog'];
+const registeredIds = slotRegistrations.map((r) => r.options.id);
+assert(DPS_IDS.every((id) => registeredIds.includes(id)), 'A3：五个插槽注册 id 全部带 dps. 包名前缀');
+const legacyIds = ['pending-banner', 'pending-mark', 'delete-session', 'pending-rename-dialog', 'delete-session-dialog'];
+assert(legacyIds.every((id) => registeredIds.includes(id) === false), 'A3：不再注册无前缀的通用 id（不会顶掉别人的那一格）');
+
+// 轻微（A3/应用卫生）：默认沙箱没有 document → 样式注入必须安静跳过，不能抛、也不能去建样式
+assert(simWarns.filter((args) => String(args[0]).includes(' styles: ')).length === 0, '样式：无 DOM 环境下不注入、不告警');
+
+// 轻微：样式是页面级资源 —— 必须由 apply 注入、并在 dispose 时摘掉（旧实现只加不删）
+const headChildren = [];
+let styleRemoved = 0;
+const styleElementStub = {
+  dataset: {},
+  set textContent(text) { this._text = text; },
+  get textContent() { return this._text; },
+  parentNode: { removeChild: () => { styleRemoved += 1; } },
+};
+const pluginStyle = loadPlugin({
+  // 样式走沙箱全局 document（插件的页面级 API），不是 ctx 属性
+  document: {
+    head: { appendChild: (el) => { headChildren.push(el); } },
+    querySelector: () => null,
+    createElement: () => styleElementStub,
+  },
+});
+pluginStyle.apply(ctx);
+assert(headChildren.length === 1 && headChildren[0].dataset.pluginCss === 'dsh-pending-session/style', '样式：apply 时注入到 <head>（带 pluginCss 标记）');
+assert(headChildren[0].textContent.includes('.dps-bar'), '样式：注入的是插件 CSS 本体');
+lastDisposer()();
+assert(styleRemoved === 1, '样式：dispose 时把注入的 <style> 摘掉（不再永久残留）');
+
+// 轻微：依赖没就绪时不能置位 APPLIED —— 否则后续重试全被短路，插件到刷新为止都不注册
+simWarns.length = 0;
+const plugin8 = loadPlugin();
+const effectsBefore8 = simEffects.length; // 必须在上面 dispose 之前取：dispose 会把最后一个 effect 弹出去
+plugin8.apply(Object.assign({}, ctx, { locale: undefined })); // 缺一个依赖
+const depsWarns = simWarns.filter((args) => String(args[0]).includes(' apply:deps: '));
+assert(effectsBefore8 === simEffects.length, '依赖缺失：这一次 apply 什么都没注册');
+assert(depsWarns.length === 1, '依赖缺失：首次告警一次（静默失效查不出来）');
+assert(depsWarns.every((args) => String(args[0]).includes(BUILD)), '依赖缺失：告警带 BUILD 版本号');
+const effectsBefore8b = simEffects.length;
+plugin8.apply(ctx); // 依赖补齐后必须还能正常 apply
+assert(simEffects.length === effectsBefore8b + 3, '依赖缺失后重试仍能装上（字典 + 样式 + dispose 三个 effect）');
+
+// 轻微（F1）：不依赖基座外的 Harness Client 包（dsh-client-store）—— 插件自带的快照 store
+// 必须满足 React 的三条硬要求：快照稳定引用、subscribe 返回退订函数、set 同步通知全部监听者
+const storeProbe = simStores[simStores.length - 1];
+assert(storeProbe !== undefined && storeProbe.getSnapshot() === storeProbe.getSnapshot(), 'F1：自带 store 的快照是稳定引用（React 不会无限渲染）');
+let storeNotified = 0;
+const storeUnsub = storeProbe.subscribe(() => { storeNotified += 1; });
+storeProbe.set({ entries: { x: 1 }, renameRequest: null, deleteRequest: null });
+assert(storeNotified === 1 && storeProbe.getSnapshot().entries.x === 1, 'F1：set 同步通知监听者并换掉快照');
+storeUnsub();
+storeProbe.set({ entries: {}, renameRequest: null, deleteRequest: null });
+assert(storeNotified === 1, 'F1：退订之后不再收到通知');
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 const hostResult = await runHostTests();

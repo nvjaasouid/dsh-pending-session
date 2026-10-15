@@ -27,14 +27,43 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		var React = require("react");
+		// 只 require 冻结模块表（PLATFORM_MODULES）里的 react 与 ui-primitives —— 官方
+		// 客户端插件规范把 ui-primitives 明确列成 Module Loader 包的隐式基座；
+		// 基座外的 Harness Client 包（例如 dsh-client-store）一律不 require，免得某个
+		// dsh 版本没把它种进模块表时直接抛 "missed the module table"。
 		var primitives = require("@deepseek-ai/dsh-client-ui-primitives");
-		var storeLib = require("@deepseek-ai/dsh-client-store");
-		var createSnapshotStore = storeLib.createSnapshotStore;
+
+		/**
+		 * 极简快照 store（就地实现，替代 @deepseek-ai/dsh-client-store 的 createSnapshotStore）。
+		 *
+		 * 插件只用到它的三个语义：getSnapshot 返回**稳定引用**（React 的
+		 * useSyncExternalStore 要求，每次都新建对象会无限渲染）、subscribe 监听、
+		 * set 立即同步通知 —— 本插件的状态唯一来源是 registry/ledger，store 只是
+		 * 「UI 读得到 + 变了就通知」的广播层，不需要 Immer/持久化/动作中间件。
+		 */
+		function createSnapshotStore(initial) {
+			var state = initial;
+			var listeners = new Set();
+			return {
+				getSnapshot: function () { return state; },
+				subscribe: function (listener) {
+					listeners.add(listener);
+					return function () { listeners.delete(listener); };
+				},
+				set: function (next) {
+					state = next;
+					var snapshot = Array.from(listeners);
+					for (var i = 0; i < snapshot.length; i++) {
+						try { snapshot[i](); } catch (error) { console.error("[dsh-pending-session] store listener failed:", error); }
+					}
+				}
+			};
+		}
 
 		// ---------------------------------------------------------------- 常量
 		var NS = "pending";
 		var DEFAULT_NAME = "待执行";
-		var BUILD = "0.1.0-r28";
+		var BUILD = "0.1.0-r33";
 		var JOURNAL_KEY = "dsh.pending-session.journal.v1";
 		/** 名称账本：sessionId -> { name, createdAt }，与注册表分开持久化。
 		 *  注册表条目一旦被清空/重建（收养、重启时序等），名字与创建时间仍能恢复。 */
@@ -91,7 +120,7 @@ window.__ModuleLoader__.load({
 			"dialog.deleteNoStorage": "删除被拒绝：磁盘上找不到该会话的存储（可能早已不存在）。",
 			"dialog.deleteStorageError": "删除失败：读写会话存储出错，稍后再试。",
 			"dialog.deleteDisposed": "删除已取消：插件刚被卸载/热更新，请重试。",
-			"dialog.deleteArchived": "⚠️ 宿主删除端点不可用，已按**归档**处理（会话仍在，可在归档会话里找回）；重启 dsh 后可真正删除。",
+			"dialog.deleteArchived": "⚠️ 宿主删除端点不可用，已按归档处理（会话仍在，可在归档会话里找回）；重启 dsh 后可真正删除。",
 			"dialog.deleteArchiveFailed": "删除失败：宿主删除端点不可用，退回系统原生归档也没成功，请稍后重试。",
 			"banner.oversize": "⚠️ 有 {n} 个附件过大未保存"
 		};
@@ -119,7 +148,7 @@ window.__ModuleLoader__.load({
 			"dialog.deleteNoStorage": "Deletion refused: no stored data for this session could be found on disk (it may already be gone).",
 			"dialog.deleteStorageError": "Deletion failed: reading or writing the session store failed. Please retry later.",
 			"dialog.deleteDisposed": "Deletion cancelled: the plugin was just unloaded or hot-reloaded. Please retry.",
-			"dialog.deleteArchived": "⚠️ The host delete endpoint is unavailable, so this was handled as **archive** (the session still exists and can be restored from archived sessions); restart dsh to delete it for real.",
+			"dialog.deleteArchived": "⚠️ The host delete endpoint is unavailable, so this was handled as archive (the session still exists and can be restored from archived sessions); restart dsh to delete it for real.",
 			"dialog.deleteArchiveFailed": "Deletion failed: the host delete endpoint is unavailable and the native archive fallback also failed. Please retry.",
 			"banner.oversize": "⚠️ {n} attachment(s) too large to save"
 		};
@@ -146,14 +175,37 @@ window.__ModuleLoader__.load({
 			".dps-deleteHint{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary)}"
 		].join("\n");
 		var styleTagId = "dsh-pending-session/style";
-		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(styleTagId) + "]") === null) {
+		/** 本实例插进 <head> 的样式标签（dispose 时摘掉，见 apply 的清理 effect）。 */
+		var styleElement = null;
+		/**
+		 * 注入插件样式。必须在 apply 里调用、并把摘除挂进 ctx.effect —— 样式是页面级
+		 * 资源，factory 作用域只加不删会把 CSS 永久留在已禁用/已卸载的插件页面里。
+		 * @returns 摘除函数（未注入时为空操作）
+		 */
+		function insertStyles() {
+			if (typeof document === "undefined" || document.head === undefined) return function () {};
+			if (styleElement !== null) return function () {};
+			var existing = null;
+			try { existing = document.querySelector("style[data-plugin-css=" + JSON.stringify(styleTagId) + "]"); } catch (_eq) { existing = null; }
+			if (existing !== null && existing !== undefined) return function () {};
 			try {
 				var styleTag = document.createElement("style");
 				styleTag.dataset.plugin = "dsh-pending-session";
 				styleTag.dataset.pluginCss = styleTagId;
 				styleTag.textContent = CSS;
 				document.head.appendChild(styleTag);
-			} catch (_e) { /* 样式失败不影响功能 */ }
+				styleElement = styleTag;
+			} catch (error) {
+				// 样式注入失败不影响功能：组件不依赖这些类名也能用（只损失外观）
+				warnOnce("styles", "插件样式注入失败（界面沿用宿主默认样式）", error);
+				return function () {};
+			}
+			return function () {
+				try {
+					if (styleElement !== null && styleElement.parentNode !== null) styleElement.parentNode.removeChild(styleElement);
+				} catch (_er) { /* ignore */ }
+				styleElement = null;
+			};
 		}
 
 		// ---------------------------------------------------------------- 小工具
@@ -676,17 +728,26 @@ window.__ModuleLoader__.load({
 		var APPLIED = false;
 		function apply(ctx) {
 			if (APPLIED) return;
-			APPLIED = true;
-			claimOwnership();
-			// 外部探针（排障脚本/用户）会读这个键确认当前页面跑的是哪个 build，保留。
-			try { localStorage.setItem("dsh.pending-session.build", BUILD); } catch (_e) { /* ignore */ }
 			var sessions = ctx.sessions;
 			var workspaces = ctx.workspaces;
 			var slots = ctx.slots;
 			var locale = ctx.locale;
-			if (!sessions || !workspaces || !slots || !locale) return;
+			if (!sessions || !workspaces || !slots || !locale) {
+				// 依赖没就绪就**不能**置位 APPLIED：否则后续重试（connection/reset、HMR、
+				// 宿主晚挂）全被短路，插件到页面刷新为止都不会再注册，而且毫无提示
+				warnOnce("apply:deps", "客户端服务未就绪（sessions/workspaces/slots/locale）：本次不注册，等重试", undefined);
+				return;
+			}
+			APPLIED = true;
+			claimOwnership();
+			// 外部探针（排障脚本/用户）会读这个键确认当前页面跑的是哪个 build，保留。
+			try { localStorage.setItem("dsh.pending-session.build", BUILD); } catch (_e) { /* ignore */ }
 
 			ctx.effect(function () { return locale.register(NS, { zh: zh, en: en }); }, "dsh-pending-session: dictionaries");
+
+			// 插件样式随 apply 注入、随 dispose 摘掉（页面级资源归 ctx.effect 管）
+			var removeStyles = insertStyles();
+			ctx.effect(function () { return removeStyles; }, "dsh-pending-session: styles");
 
 			// ---- 卸载/热更新门闸 ----
 			// dispose 之后旧实例必须彻底停手：否则延迟续跑（转正改名、附件恢复重试、
@@ -1025,7 +1086,9 @@ window.__ModuleLoader__.load({
 					return fetch(OWN_DELETE_PATH, {
 						method: "POST",
 						headers: { "content-type": "application/json" },
-						body: JSON.stringify({ ids: [sessionId] })
+						// pruneStale：用户明确要求删这一行 → 如果盘上真的已经没有它任何存储，
+						// 请把 workspace 记账里的悬空引用一并摘掉（否则界面上那行永远删不掉）
+						body: JSON.stringify({ ids: [sessionId], pruneStale: true })
 					});
 				}).then(function (response) {
 					if (response === undefined || response.ok === false) return undefined;
@@ -1048,11 +1111,16 @@ window.__ModuleLoader__.load({
 							return { deleted: true, via: "own" };
 						}
 						if (String(row.reason || "") === "not-found") {
-							// 「什么都没删」只有在确实没有存储时才等于成功：待执行条目
-							// （本就可能没落盘）算成功，普通会话则不认，否则会话还在却
-							// 报删除成功、条目/行也没了。
-							if (treatNotfoundAsSuccess(sessionId)) {
-								journalPush({ op: "delete-absent", id: sessionId });
+							// 「什么都没删」只有在确实没有存储时才等于成功。宿主只在
+							// 「两种拼写的目录都没有 + per-session 投影缓存没有 + 聚合索引里也没有」
+							// 时才回 not-found，所以：
+							//   - 待执行条目 / 空白会话（本就可能没落盘）→ 算成功；
+							//   - 行的存储被外部删掉的悬空引用（点了删除、界面上还留着、点开报
+							//     ENOENT）→ 宿主已按我们的 pruneStale 要求把 workspace 记账摘掉，
+							//     这里必须跟着把行/条目清掉，否则用户永远删不掉这一行。
+							var pruned = row.prunedStale === true;
+							if (pruned || treatNotfoundAsSuccess(sessionId)) {
+								journalPush({ op: pruned ? "delete-stale-pruned" : "delete-absent", id: sessionId });
 								return { deleted: true, via: "absent" };
 							}
 							journalPush({ op: "delete-no-storage", id: sessionId });
@@ -1505,11 +1573,14 @@ window.__ModuleLoader__.load({
 			var mirrorActive = false;
 			var saveTimer = 0;
 			var lastSavedManifest = null;
+			/** 本轮镜像里是否已经记过「非空白，跳过镜像」（见下方 handler：不能每键记一次）。 */
+			var skipLogged = false;
 
 			function startMirroring(id) {
 				mirrorDispose();
 				mirrorDispose = function () {};
 				mirrorActive = false;
+				skipLogged = false;
 				if (id === undefined) return;
 				var shell = shellFor(id);
 				if (shell === undefined) return;
@@ -1524,7 +1595,13 @@ window.__ModuleLoader__.load({
 					if (isBlankSession(id) === false) {
 						activeMirror.value = null;
 						cleanupActive(id);
-						journalPush({ op: "skip-non-blank", id: id, reason: "mirror" });
+						// 这个分支在普通对话里**每次状态变化都会走到**（打字时每键一次）：
+						// 每次都记 = 每键写一次 localStorage，而且会把 journal 的 300 条
+						// 环形容量挤满、冲掉真正有用的增删改记录。同一个会话只记第一次。
+						if (!skipLogged) {
+							skipLogged = true;
+							journalPush({ op: "skip-non-blank", id: id, reason: "mirror" });
+						}
 						return;
 					}
 					activeMirror.value = {
@@ -1961,7 +2038,7 @@ window.__ModuleLoader__.load({
 			injectSlot("conversation.input.dock", function () {
 				return slots.register({
 					name: "conversation.input.dock",
-					id: "pending-banner",
+					id: "dps.pending-banner",
 					order: 5,
 					locale: NS,
 					inject: function (sessionId) {
@@ -1984,7 +2061,7 @@ window.__ModuleLoader__.load({
 			injectSlot("sidebar.session.row.leading", function () {
 				return slots.register({
 					name: "sidebar.session.row.leading",
-					id: "pending-mark",
+					id: "dps.pending-mark",
 					order: 10,
 					locale: NS,
 					inject: function () {
@@ -1998,7 +2075,7 @@ window.__ModuleLoader__.load({
 				// 对所有会话可用（待执行条目显示为「删除待执行」）。
 				yield slots.register({
 					name: "sidebar.workspaces.session.menu.item",
-					id: "delete-session",
+					id: "dps.delete-session",
 					order: 460,
 					locale: NS,
 					inject: function () {
@@ -2014,7 +2091,7 @@ window.__ModuleLoader__.load({
 			injectSlot("shell.overlay", function () {
 				return slots.register({
 					name: "shell.overlay",
-					id: "pending-rename-dialog",
+					id: "dps.pending-rename-dialog",
 					locale: NS,
 					inject: function () {
 						return {
@@ -2030,7 +2107,7 @@ window.__ModuleLoader__.load({
 			injectSlot("shell.overlay", function () {
 				return slots.register({
 					name: "shell.overlay",
-					id: "delete-session-dialog",
+					id: "dps.delete-session-dialog",
 					locale: NS,
 					inject: function () {
 						return {
@@ -2070,6 +2147,8 @@ window.__ModuleLoader__.load({
 						try { window.removeEventListener("beforeunload", beforeUnloadHandler); } catch (_e) { /* ignore */ }
 					}
 					restorePatch();
+					// 样式是页面级资源：本实例卸载时一并摘掉（removeStyles 幂等，重复调无害）
+					removeStyles();
 				};
 			}, "dsh-pending-session: dispose");
 

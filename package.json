@@ -14,7 +14,11 @@
     "client.js",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "README.en.md",
+    "FAQ.md",
+    "LICENSE",
+    "docs/**",
+    "tests/**"
   ],
   "keywords": [
     "dsh",
@@ -26,10 +30,15 @@
     "待执行"
   ],
   "scripts": {
-    "test": "node tests/sim.mjs"
+    "test": "node tests/sim.mjs",
+    "verify": "node tests/sim.mjs"
   },
   "license": "MIT",
   "author": "nvjaasouid",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nvjaasouid/dsh-pending-session.git"
@@ -39,8 +48,10 @@
     "url": "https://github.com/nvjaasouid/dsh-pending-session/issues"
   },
   "engines": {
-    "node": ">=22",
-    "dsh": ">=0.2.0-rc.2"
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "0.2.0-rc.2"
   },
   "dsh": {
     "client": {
@@ -50,7 +61,9 @@
         "@deepseek-ai/dsh-client-ui-workspace",
         "@deepseek-ai/dsh-client-ui-session"
       ],
-      "external": []
+      "external": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
     },
     "bundle": {
       "patch": "./cordis.patch.yml"

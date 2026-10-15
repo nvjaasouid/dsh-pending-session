@@ -1,9 +1,16 @@
 # dsh-pending-session
 
+code by: V41-Flash  
+token by: 我自己(  
+另外感谢ds崩溃梁圣用50返50🙏
+
 **把还没发送的会话草稿 保存在侧边栏**
 
 ![示例1](docs/image-2-1.png)
 ![示例2](docs/image-3-1.png)
+
+> [!WARNING]
+> 除了保存草稿，本插件还会给**每条会话行**加一项「删除会话」：真删除会话日志、投影缓存与工作区记账，**不可恢复**（不是归档）。详见「安全与数据」。
 
 ## 核心功能
 
@@ -30,7 +37,7 @@
 - **编辑**
 - **重命名**
 - **归档**
-- **删除**（会话下拉栏处；批量删除/归档管理不在本插件范围内）
+- **删除**（会话下拉栏处；暂不支持 dsh-session-archive 的多选删除）
 - **发送**
 
 ## 安装 / 卸载
@@ -59,14 +66,6 @@ pnpm remove dsh-pending-session
 
 已有对话、归档记录都不受影响，侧边栏恢复成原生样子。
 
-> [!NOTE]
-> 卸载**不会**清掉插件留在浏览器里的本地数据，重装后会被重新捡回。想彻底清干净就手动删掉这些键：
->
-> - `dsh.pending-session.registry.v1`、`dsh.pending-session.names.v1` —— 待执行条目与名称/时间账本
-> - `dsh.pending-session.active.v1` —— 退出时活动新会话的草稿文本；`dsh.conversation.<会话id>` —— 被我们改写过 `draft` 的原生草稿键
-> - `dsh.pending-session.journal.v1` —— 取证日志；`dsh.pending-session.owner.v1`、`dsh.pending-session.build` —— 所有权令牌与版本探针
-> - IndexedDB 数据库 `dsh-pending-session`（存储 `attachments`）—— 附件字节
-
 ## 安全与数据
 
 > [!CAUTION]
@@ -77,15 +76,16 @@ pnpm remove dsh-pending-session
 - 🚫 **正在运行的会话（agent 还在输出）不允许删除**
 - 📦 **归档 ≠ 删除**：归档只是从侧边栏收起，在「归档会话」里还能找回来
 - 🧹 草稿清空到只剩空白后离开，条目会被自动收走（仅归档，不删数据）
-- 🛡️ 删除由插件自带的宿主端点完成；**该端点不可用（例如装了插件但没重启 dsh）时只做系统原生归档、不会真删**，确认框会明确写成「已按归档处理」而不是「删除成功」，重启 dsh 后可以再删一次
-- 🗄️ 插件**不处理** DSH 的 sqlite 持久化检索索引（session-query 的派生读模型，实测 schema 为 `application_id=1146308689` / `user_version=8`，表 `persisted_sessions` + fts5 `persisted_docs`）：它由会话日志重建，日志删掉后 DSH 自己会收敛。若将来 DSH 把它变成权威存储，删除路径必须另行清理
-- 📎 **单个附件超过 64MB 不写进本地缓存**：条目照常建立，横幅会提示「有 N 个附件过大未保存」，重新打开条目时只恢复其余附件
+- 🛡️ 删除由插件自带的宿主端点完成；该端点不可用时，退回系统原生的归档行为
+
+## FAQ
+详见 [FAQ.md](FAQ.md)
 
 ## 开发
 
 ```
 client.js          浏览器半边（界面、草稿镜像、侧边栏投影、删除流程）
-index.js           宿主半边（删除端点：会话目录 + 投影缓存 + 工作区记账）
+index.js           宿主半边（删除端点：清理会话存储与工作区记账）
 cordis.patch.yml   bundle 行声明
 tests/sim.mjs      模拟测试
 ```
@@ -103,6 +103,3 @@ npm test        # 等价于 node tests/sim.mjs
 
 MIT © 2026 nvjaasouid
 
-
-code by: V41-Flash  
-token by: 我自己(

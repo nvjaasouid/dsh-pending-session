@@ -58,8 +58,8 @@ function makeReq(ids, opts = {}) {
   }
   return {
     req,
-    fire() {
-      const payload = Buffer.from(JSON.stringify({ ids }), 'utf8');
+    fire(extra) {
+      const payload = Buffer.from(JSON.stringify(Object.assign({ ids }, extra || {})), 'utf8');
       listeners.data?.(payload);
       listeners.end?.();
     },
@@ -75,17 +75,23 @@ async function callHandler(handler, ids, opts = {}) {
     end(text) { body = JSON.parse(text); },
   };
   const done = handler(req, res);
-  fire();
+  fire(opts.pruneStale === true ? { pruneStale: true } : undefined);
   await done;
   return { status, body };
 }
 
-/** 假 workspaceRegistry：记录 mutate 是否被调用，并真的摘除 id。 */
+/** 假 workspaceRegistry：记录 mutate 是否被调用，并真的改掉 sessionIds（贴近真实实现）。 */
 function makeRegistry() {
   const entity = {
     sessionIds: [],
     mutated: 0,
-    async mutate(fn) { this.mutated++; this.record = fn({ sessionIds: this.sessionIds }); },
+    async mutate(fn) {
+      this.mutated++;
+      this.record = fn({ sessionIds: this.sessionIds });
+      if (this.record !== null && typeof this.record === 'object' && Array.isArray(this.record.sessionIds)) {
+        this.sessionIds = this.record.sessionIds;
+      }
+    },
   };
   return { registry: { list: () => [entity] }, entity };
 }
@@ -269,6 +275,126 @@ export async function runHostTests() {
   }
   assert(allowedOk === sameOrigin.length, `同源 JSON 请求照旧放行（${allowedOk}/${sameOrigin.length}）`);
   fs.rmSync(h10.home, { recursive: true, force: true });
+
+  // ---- 用例 11（B3）：id 形状白名单 —— 破坏性端点只认会话 id，不认任意目录名 ----
+  const id11 = 'session-55555555-4444-3333-2222-111111111111';
+  const h11 = makeHome(id11, { projSpelling: 'none', index: false });
+  const dir11 = join(h11.home, 'sessions', '--C-fake-workspace--', id11);
+  process.env.DSH_HOME = h11.home;
+  const handler11 = createDeleteHandler({ get: () => undefined });
+  // 这五种都不是会话 id 的形状：带 ..、带分隔符、非 uuid 名、前缀错误的 uuid、几乎合法的 uuid（多一位）
+  const malformed = ['../../etc/passwd', 'a/b', 'session-evil', 'other-11111111-2222-3333-4444-555555555555', 'session-11111111-2222-3333-4444-5555555555555'];
+  const r11 = await callHandler(handler11, malformed);
+  process.env.DSH_HOME = savedHome;
+  assert(r11.status === 400 && r11.body.ok === false, 'B3：非会话 id 形状的 id 全部拒绝（400）');
+  assert(fs.existsSync(dir11) === true, 'B3：被拒请求一个字节都没碰（会话目录还在）');
+  fs.rmSync(h11.home, { recursive: true, force: true });
+
+  // ---- 用例 12（B3）：正在运行的会话，端点自己拒绝删除（第二道自我闸门）----
+  const id12 = 'session-12121212-3434-5656-7878-909090909090';
+  const h12 = makeHome(id12, { projSpelling: 'none', index: false });
+  const dir12 = join(h12.home, 'sessions', '--C-fake-workspace--', id12);
+  const bare12 = id12.replace(/^session-/, '');
+  const handler12 = createDeleteHandler({
+    // 宿主公开服务：agents.get(sessionId) 返回活 agent，status='running' 即"正在跑"
+    get: (name) => (name === 'agents'
+      ? { get: (sid) => (sid === bare12 || sid === id12 ? { status: 'running' } : undefined) }
+      : undefined),
+  });
+  process.env.DSH_HOME = h12.home;
+  const r12 = await callHandler(handler12, [id12]);
+  process.env.DSH_HOME = savedHome;
+  assert(r12.body?.results?.[0]?.status === 'failed' && r12.body.results[0].reason === 'running', 'B3：正在运行的会话被端点拒绝（reason=running）');
+  assert(fs.existsSync(dir12) === true, 'B3：被拒的会话目录原样保留');
+
+  // 空闲 agent（status=idle）+ 读不到 agents 服务：都不能误伤正常删除
+  const idle = await (async () => {
+    process.env.DSH_HOME = h12.home;
+    const r = await callHandler(
+      createDeleteHandler({ get: (name) => (name === 'agents' ? { get: () => ({ status: 'idle' }) } : undefined) }),
+      [id12],
+    );
+    process.env.DSH_HOME = savedHome;
+    return r;
+  })();
+  assert(idle.body?.results?.[0]?.status === 'ok' && fs.existsSync(dir12) === false, 'B3：空闲会话照旧删得掉（闸门不误伤）');
+
+  const h12b = makeHome(id12, { projSpelling: 'none', index: false });
+  const dir12b = join(h12b.home, 'sessions', '--C-fake-workspace--', id12);
+  process.env.DSH_HOME = h12b.home;
+  const noAgents = await callHandler(
+    // agents 服务存在但 get 抛错：读不到运行状态 → 不因为它把删除全禁掉
+    createDeleteHandler({ get: (name) => (name === 'agents' ? { get: () => { throw new Error('boom') } } : undefined) }),
+    [id12],
+  );
+  process.env.DSH_HOME = savedHome;
+  assert(noAgents.body?.results?.[0]?.status === 'ok', 'B3：agents.get 抛错时按"拿不到状态"处理，不阻断删除');
+  assert(fs.existsSync(dir12b) === false, 'B3：兜底路径确实删掉了目录');
+  fs.rmSync(h12.home, { recursive: true, force: true });
+  fs.rmSync(h12b.home, { recursive: true, force: true });
+
+  // ---- 用例 13：悬空引用（盘上什么都没有、workspace 记账还留着）→ 默认不摘 ----
+  // 用户实测：这种行在侧边栏排一行，点开报 ENOENT，点删除回 not-found 就再也动不了。
+  const id13 = 'session-31313131-4141-5151-6161-717171717171';
+  const h13 = fs.mkdtempSync(join(os.tmpdir(), 'dps-host-'));
+  fs.mkdirSync(join(h13, 'sessions', '--C-fake-workspace--'), { recursive: true });
+  fs.mkdirSync(join(h13, 'storages'), { recursive: true });
+  const reg13 = makeRegistry();
+  reg13.entity.sessionIds = [id13, 'keep-me'];
+  process.env.DSH_HOME = h13;
+  const r13 = await callHandler(
+    createDeleteHandler({ get: (name) => (name === 'workspaceRegistry' ? reg13.registry : undefined) }),
+    [id13],
+  );
+  process.env.DSH_HOME = savedHome;
+  const row13 = r13.body?.results?.[0];
+  assert(row13?.status === 'skipped' && row13.reason === 'not-found', '悬空引用：没有 pruneStale 时如实回 not-found');
+  assert(row13?.prunedStale === false, '悬空引用：没有 pruneStale 时不摘记账（存储还在时摘记账会掉进未分组）');
+  assert(reg13.entity.mutated === 0, '悬空引用：workspace 记账一个字节都没动');
+  fs.rmSync(h13, { recursive: true, force: true });
+
+  // ---- 用例 14：带 pruneStale 的悬空引用 → 摘掉记账，让那一行能真正消失 ----
+  const id14 = 'session-14141414-2424-3434-4444-545454545454';
+  const h14 = fs.mkdtempSync(join(os.tmpdir(), 'dps-host-'));
+  fs.mkdirSync(join(h14, 'sessions', '--C-fake-workspace--'), { recursive: true });
+  fs.mkdirSync(join(h14, 'storages'), { recursive: true });
+  const reg14 = makeRegistry();
+  reg14.entity.sessionIds = [id14, 'keep-me'];
+  process.env.DSH_HOME = h14;
+  const r14 = await callHandler(
+    createDeleteHandler({ get: (name) => (name === 'workspaceRegistry' ? reg14.registry : undefined) }),
+    [id14],
+    { pruneStale: true },
+  );
+  process.env.DSH_HOME = savedHome;
+  const row14 = r14.body?.results?.[0];
+  assert(row14?.status === 'skipped' && row14.reason === 'not-found' && row14.prunedStale === true, '悬空引用：pruneStale 时回报 prunedStale=true');
+  assert(reg14.entity.sessionIds.indexOf(id14) === -1 && reg14.entity.sessionIds.indexOf('keep-me') !== -1, '悬空引用：只摘掉目标会话，其他记账不动');
+  fs.rmSync(h14, { recursive: true, force: true });
+
+  // ---- 用例 15：只剩投影缓存记录、目录已不在 → 按「确实删掉了东西」走主路径并摘记账 ----
+  // （not-found 分支的判据是「目录/缓存/索引三处都没有」；这里缓存还在 → 说明并非悬空，
+  //  删掉缓存后再摘记账，语义仍是「先确认删到东西，才动记账」）
+  const id15 = 'session-15151515-2525-3535-4545-555555555555';
+  const h15 = fs.mkdtempSync(join(os.tmpdir(), 'dps-host-'));
+  fs.mkdirSync(join(h15, 'sessions', '--C-fake-workspace--'), { recursive: true });
+  const proj15 = join(h15, 'storages', 'session_projcache', 'sessions');
+  fs.mkdirSync(proj15, { recursive: true });
+  fs.writeFileSync(join(proj15, `${id15}.json`), JSON.stringify({ version: 7, record: { rows: {} } }));
+  const reg15 = makeRegistry();
+  reg15.entity.sessionIds = [id15];
+  process.env.DSH_HOME = h15;
+  const r15 = await callHandler(
+    createDeleteHandler({ get: (name) => (name === 'workspaceRegistry' ? reg15.registry : undefined) }),
+    [id15],
+    { pruneStale: true },
+  );
+  process.env.DSH_HOME = savedHome;
+  const row15 = r15.body?.results?.[0];
+  assert(row15?.status === 'ok' && row15.removedProjcache === true, '只剩缓存：删掉缓存记录并回 ok');
+  assert(fs.existsSync(join(proj15, `${id15}.json`)) === false, '只剩缓存：缓存文件确实没了');
+  assert(reg15.entity.sessionIds.indexOf(id15) === -1, '只剩缓存：确认删到东西后摘掉记账（不是悬空分支）');
+  fs.rmSync(h15, { recursive: true, force: true });
 
   return out;
 }

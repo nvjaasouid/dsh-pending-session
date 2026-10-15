@@ -42,6 +42,8 @@ export const inject = ['webServer']
 
 const ROUTE_PATH = '/api/dsh-pending-session/delete'
 const BODY_MAX_BYTES = 200_000
+/** 会话 id 白名单：`session-<uuid>` 或裸 `<uuid>`，不区分大小写。 */
+const SESSION_ID_PATTERN = /^(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 function dshHome() {
   const env = process.env.DSH_HOME
@@ -51,6 +53,11 @@ function dshHome() {
 /** 会话段的规范化：DSH 存储以 `session-<uuid>` 或裸 `<uuid>` 命名。 */
 function canonicalId(id) {
   return id.startsWith('session-') ? id : `session-${id}`
+}
+
+/** 会话 id 的裸 uuid 拼写（去掉可选的 `session-` 前缀）。 */
+function bareId(id) {
+  return id.startsWith('session-') ? id.slice('session-'.length) : id
 }
 
 /** 段目录名的候选写法：DSH 实测**保留** `session-` 前缀，另一种布局会去掉，两种都试。 */
@@ -141,7 +148,7 @@ function findSessionDirs(sessionsRoot, id) {
  * @returns { removed: boolean, removedIndex: boolean }
  */
 function deleteProjcache(home, id) {
-  const outcome = { removed: false, removedIndex: false }
+  const outcome = { removed: false, removedIndex: false, indexTouched: false }
   const sessionDirRoot = join(home, 'storages', 'session_projcache', 'sessions')
   let dirReal
   try {
@@ -175,6 +182,7 @@ function deleteProjcache(home, id) {
           }
         }
         if (touched) {
+          outcome.indexTouched = true
           // 原子写：先写临时文件再 rename 覆盖。整文件重写一旦写到一半崩掉/被杀，
           // 索引就剩半截 JSON —— harness 读不出来，整批会话的标题/时间一起消失。
           // rename 在同一目录内是原子替换；失败则原文件不动，并清掉临时文件。
@@ -197,6 +205,35 @@ function deleteProjcache(home, id) {
     // 索引损坏/被占用：留给 harness 自己收敛，不影响删除结论
   }
   return outcome
+}
+
+/**
+ * 把一个会话从工作区记账（workspaceRegistry 的实体 sessionIds）里摘掉。
+ * 一条会话可能同时出现在多个实体里，全部摘；返回是否真的动过。
+ * 记账清理失败不阻塞数据删除：会话数据已经删了，行会在下次扫描时收敛。
+ */
+async function pruneWorkspaceRegistry(ctx, id) {
+  let touched = false
+  try {
+    const registry = ctx.get('workspaceRegistry') ?? ctx.workspaceRegistry
+    if (registry === undefined || registry === null || typeof registry.list !== 'function') return false
+    for (const entity of registry.list() ?? []) {
+      if (entity === null || typeof entity !== 'object') continue
+      if (typeof entity.mutate !== 'function') continue
+      const list = Array.isArray(entity.sessionIds) ? entity.sessionIds : []
+      if (!list.some((value) => canonicalId(String(value)) === id)) continue
+      await entity.mutate((record) => ({
+        ...record,
+        sessionIds: (Array.isArray(record?.sessionIds) ? record.sessionIds : []).filter(
+          (value) => canonicalId(String(value)) !== id,
+        ),
+      }))
+      touched = true
+    }
+  } catch {
+    return touched
+  }
+  return touched
 }
 
 /** 只接受回环来源；隧道/局域网一律拒绝。 */
@@ -266,6 +303,28 @@ function writeJson(res, status, body) {
   res.end(text)
 }
 
+/**
+ * 该会话是否**正在运行**（agent 有在跑的 turn）。
+ *
+ * 这是端点自己的第二道闸门：同源校验只证明"请求来自本页"，证不了"删它不会毁掉
+ * 正在产生的输出"。客户端 UI 也会拦一次（行 running 标志），但那一道在客户端，
+ * 端点作为对外暴露的破坏性能力必须自证。
+ *
+ * 判定用宿主公开服务 `ctx.agents.get(sessionId)?.status === 'running'`（DSH 自己的
+ * 归档准入用的就是同一个判据）。服务缺失/抛错一律返回 false —— 不能因为读不到
+ * 状态就把删除全禁掉，那会让插件在没有 agents 服务的 profile 里彻底不可用。
+ */
+function isSessionRunning(ctx, id) {
+  try {
+    const agents = (typeof ctx?.get === 'function' ? ctx.get('agents') : undefined) ?? ctx?.agents
+    if (agents === undefined || agents === null || typeof agents.get !== 'function') return false
+    const agent = agents.get(id) ?? agents.get(canonicalId(id))
+    return agent !== undefined && agent !== null && agent.status === 'running'
+  } catch {
+    return false
+  }
+}
+
 /** 路由处理器：拆成独立导出，便于用假 DSH_HOME 做无头测试（不注册真实路由）。 */
 export function createDeleteHandler(ctx) {
   return async (req, res) => {
@@ -284,10 +343,16 @@ export function createDeleteHandler(ctx) {
       }
       const body = await readJsonBody(req)
       const rawIds = body !== null && typeof body === 'object' && Array.isArray(body.ids) ? body.ids : []
+      // pruneStale：调用方确认「这条行在界面上还在、但存储已经没了，请把悬空引用一起清掉」。
+      // 只有明确要求时才会摘记账，见下面的 not-found 分支。
+      const pruneStale = body !== null && typeof body === 'object' && body.pruneStale === true
       const requests = []
       for (const value of rawIds) {
         if (typeof value !== 'string' || value === '' || value.length > 200) continue
         if (value.includes('/') || value.includes('\\') || value.includes('..')) continue // 路径安全
+        // 白名单：只认会话 id 的形状（`session-<uuid>` / 裸 `<uuid>`）。破坏性端点不接受
+        // 任意目录名 —— 否则一个受控的 id（哪怕同源伪造）就能删掉 sessions 下同名目录。
+        if (!SESSION_ID_PATTERN.test(value)) continue
         // original 用于回显（原样拼写），canonical 用于内部查找（两种拼写都试）
         requests.push({ original: value, canonical: canonicalId(value) })
       }
@@ -302,6 +367,17 @@ export function createDeleteHandler(ctx) {
 
       for (const request of requests) {
         const id = request.canonical
+        // 正在跑的会话：先拒，连一个字节都不碰（第二道自我闸门，见 isSessionRunning）
+        let running = false
+        try {
+          running = isSessionRunning(ctx, bareId(id))
+        } catch {
+          running = false
+        }
+        if (running) {
+          results.push({ id: request.original, status: 'failed', reason: 'running', removedDirs: 0, freedBytes: 0 })
+          continue
+        }
         let freedBytes = 0
         let removedDirs = 0
         let failedDirs = 0
@@ -324,34 +400,31 @@ export function createDeleteHandler(ctx) {
         const projcache = deleteProjcache(home, id)
 
         if (removedDirs === 0 && !projcache.removed && !projcache.removedIndex) {
-          // 磁盘上本来就没有该会话的存储（例如只有草稿、从未落盘的空白会话）：
-          // 什么都别动，尤其不要摘工作区记账——否则会话会掉进「未分组」却还活着。
-          results.push({ id: request.original, status: 'skipped', reason: 'not-found', freedBytes: 0 })
+          // 磁盘上**没有**该会话的任何存储。这里有两种截然不同的局面：
+          //   a) 从未落盘的空白会话（正常）：什么都没删，如实回报 not-found，不动记账；
+          //   b) 存储被外部删掉了、但 workspace 记账还留着它（悬空引用）：侧边栏照样显示
+          //      一行「未分组」，点开报 ENOENT —— 行删不掉、也进不去，用户被卡住。
+          // b 只有调用方明确要求（pruneStale）时才处理：判据要同时满足「两种拼写都没有
+          // 目录」「per-session 投影缓存也没有」「聚合索引里也没有该行」，只要有一处还在，
+          // 就不动记账（那条血泪教训：存储还在时摘记账 = 会话掉进未分组却还活着）。
+          const absentEverywhere = !projcache.indexTouched
+          let registryTouched = false
+          if (pruneStale && absentEverywhere) {
+            registryTouched = await pruneWorkspaceRegistry(ctx, id)
+          }
+          results.push({
+            id: request.original,
+            status: 'skipped',
+            reason: 'not-found',
+            prunedStale: registryTouched,
+            freedBytes: 0,
+          })
           continue
         }
 
         // 只有确实删掉了存储，才摘工作区记账（第三方同款 mutate 路径）
         let registryTouched = false
-        try {
-          const registry = ctx.get('workspaceRegistry') ?? ctx.workspaceRegistry
-          if (registry !== undefined && typeof registry.list === 'function') {
-            for (const entity of registry.list() ?? []) {
-              if (entity === null || typeof entity !== 'object') continue
-              if (typeof entity.mutate !== 'function') continue
-              const list = Array.isArray(entity.sessionIds) ? entity.sessionIds : []
-              if (!list.some((value) => canonicalId(String(value)) === id)) continue
-              await entity.mutate((record) => ({
-                ...record,
-                sessionIds: (Array.isArray(record?.sessionIds) ? record.sessionIds : []).filter(
-                  (value) => canonicalId(String(value)) !== id,
-                ),
-              }))
-              registryTouched = true
-            }
-          }
-        } catch {
-          // 记账清理失败不阻塞数据删除：会话数据已删，行会在下次扫描时收敛
-        }
+        registryTouched = await pruneWorkspaceRegistry(ctx, id)
 
         {
           results.push({

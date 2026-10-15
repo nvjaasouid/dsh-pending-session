@@ -1,74 +1,92 @@
 # dsh-pending-session
 
-Keep unsent chat drafts in the sidebar.
+code by: V41-Flash  
+token by: 我自己(  
+另外感谢ds崩溃梁圣用50返50🙏
 
-Type something in a new session, then go look at another conversation — natively that session is treated as blank and hidden. This plugin keeps it as a **Pending** entry in the sidebar instead. Click it to keep writing; send it and it becomes a normal conversation.
+**Keep unsent chat drafts in the sidebar**
 
-![Pending entry](docs/image-3.png)
+![Example 1](docs/image-2-1.png)
+![Example 2](docs/image-3-1.png)
 
-![Pending banner](docs/image-2.png)
+> [!WARNING]
+> Besides keeping drafts, this plugin adds a **Delete conversation** action to **every session row**: it permanently removes the session log, the projection cache and the workspace accounting — **it cannot be undone** (this is not archiving). See “Safety and data” below.
+
+## Core features
+
+When you have typed something into a session but have not sent it yet, and then open another conversation or start a new one, that session is no longer hidden: it stays in the sidebar as an entry named **Pending**, side by side with your normal conversations.
+
+Click a pending entry and send, and it becomes a normal conversation.  
+A pending draft that is cleared down to whitespace and then left behind is collected automatically.
+
+Several pending entries can coexist.  
+Pending entries never affect each other or your normal conversations.
+
+Everything sorts by time:
+
+- Pending entries by their creation time
+- Normal conversations by the last time you sent a message to dsh
+- Editing a draft does not change a pending entry's position
+
+Pending entries are stored locally and survive a dsh restart.
 
 ## What you can do with a pending entry
 
-- **Keep editing** — clicking it opens the native composer with your text and attachments restored
-- **Rename** — the row menu's Rename, or double-click the title
-- **Archive** — it leaves the sidebar but is *not* deleted; find it again under archived sessions
-- **Delete** — from the row's “…” menu: a real delete, the conversation history is removed and **cannot be recovered**. Sessions that are still running cannot be deleted. Batch delete / archive management is out of this plugin's scope
-- **Send** — it stops being pending, becomes a normal conversation, and moves to the top by send time
+At any time you can:
 
-## Behaviour notes
+- **Edit**
+- **Rename**
+- **Archive**
+- **Delete** (from the session row's “…” menu; multi-select delete from dsh-session-archive is not supported yet)
+- **Send**
 
-- Multiple pending entries can coexist; they never affect each other or normal conversations
-- Entries sort together with normal conversations by the last send time. A pending entry's time is **its creation time** — editing the draft does not change its time or position
-- Only blank sessions with a draft (text or attachments) become pending; sessions that already have messages are untouched
-- Drafts and attachments are stored locally and survive a restart
+## Install / Uninstall
 
-## Install
+**Install** (either way):
 
-Install by name from the dsh plugin manager (Settings → Plugins):
-
-```
+```sh
+# 1) By name, from dsh's plugin manager (Settings → Plugins)
 dsh-pending-session
 ```
 
-Or with a package manager inside the profile directory:
-
 ```sh
+# 2) With a package manager inside the profile directory
 pnpm add dsh-pending-session
 ```
 
-Restart dsh once after installing (the host half loads at startup).
+> [!IMPORTANT]
+> Restart dsh once after installing — the host half loads at startup, and without a restart the delete feature does not work.
 
-## Uninstall
+**Uninstall**:
 
-Disable or remove it in the plugin manager. Existing conversations and archived records are not affected; the sidebar returns to its native look.
+```sh
+# Disable / remove it in the plugin manager, or:
+pnpm remove dsh-pending-session
+```
 
-> [!NOTE]
-> Uninstalling does **not** wipe the data the plugin left in your browser — reinstall it and everything is picked up again. To clear it for good, delete these keys by hand:
->
-> - `dsh.pending-session.registry.v1`, `dsh.pending-session.names.v1` — the pending entries and the name/creation-time ledger
-> - `dsh.pending-session.active.v1` — the draft text of the session that was active when you quit; `dsh.conversation.<session-id>` — native draft keys whose `draft` field we rewrote
-> - `dsh.pending-session.journal.v1` — the diagnostic journal; `dsh.pending-session.owner.v1`, `dsh.pending-session.build` — ownership token and build probe
-> - the IndexedDB database `dsh-pending-session` (store `attachments`) — the attachment bytes
+Existing conversations and archived records are unaffected; the sidebar returns to its native look.
 
 ## Safety and data
 
-The plugin adds a **Delete conversation** item to every session row's “…” menu, and that delete is permanent (session log, projection cache and workspace accounting are all removed):
+> [!CAUTION]
+> ### ⚠️ Delete means real deletion, **and it cannot be undone**
+> This plugin adds a **Delete conversation** item to the “…” menu of **every session row (not just pending ones)**.
+> It wipes the **session log, projection cache and workspace accounting** — that is not archiving, and it cannot be recovered.
 
-- A session whose agent is still running cannot be deleted
-- Archive and delete are different things: archiving only hides the session and is reversible
-- Clearing a draft back to blank and leaving removes the entry (archived only, no data loss)
-- **Attachments over 64MB are not cached locally** — the entry is still created and the banner says “⚠️ {n} attachment(s) too large to save”; reopening the entry restores the other attachments only
+- 🚫 **A session that is still running (agent still producing output) cannot be deleted**
+- 📦 **Archive ≠ delete**: archiving only hides a session from the sidebar, and you can find it again under archived sessions
+- 🧹 Clearing a draft down to whitespace and leaving collects the entry (archived only, no data loss)
+- 🛡️ Deletion is done by the plugin's own host endpoint; **when that endpoint is unavailable it falls back to dsh's native archive** instead of deleting
 
-Deletion is handled by the plugin's own host endpoint. **When that endpoint is unavailable (for example the plugin was installed but dsh was not restarted) nothing is really deleted — the session is only archived**, and the confirmation dialog says so instead of reporting success; restart dsh and delete again to remove it for real.
+## FAQ
 
-The plugin deliberately does **not** touch DSH's sqlite persistent search index (the session-query derived read model: `application_id=1146308689`, `user_version=8`, tables `persisted_sessions` plus the fts5 `persisted_docs`). That index is rebuilt from the session logs, so removing the logs is enough for DSH to converge on its own; if DSH ever turns it into authoritative storage, the delete path must clean it up explicitly.
+See [FAQ.md](FAQ.md) (Chinese).
 
 ## Development
 
 ```
 client.js          browser half (UI, draft mirror, sidebar projection, delete flow)
-index.js           host half (delete endpoint: session dirs + projection cache + workspace accounting)
+index.js           host half (delete endpoint: session storage + workspace accounting)
 cordis.patch.yml   bundle row declaration
 tests/sim.mjs      simulation tests
 ```
@@ -79,8 +97,8 @@ Run the tests:
 npm test        # same as: node tests/sim.mjs
 ```
 
-Local development: the browser half (client.js) hot-reloads when copied into the profile's `node_modules`; the **host half (index.js) requires a dsh restart**.
+Local development: the browser half (client.js) hot-reloads when copied into the profile's `node_modules`; a change to the host half (index.js) requires a dsh restart.
 
 ## License
 
-MIT
+MIT © 2026 nvjaasouid
