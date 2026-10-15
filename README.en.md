@@ -13,7 +13,7 @@ Type something in a new session, then go look at another conversation — native
 - **Keep editing** — clicking it opens the native composer with your text and attachments restored
 - **Rename** — the row menu's Rename, or double-click the title
 - **Archive** — it leaves the sidebar but is *not* deleted; find it again under archived sessions
-- **Delete** — a real delete: the conversation history is removed and **cannot be recovered**. Sessions that are still running cannot be deleted
+- **Delete** — from the row's “…” menu: a real delete, the conversation history is removed and **cannot be recovered**. Sessions that are still running cannot be deleted. Batch delete / archive management is out of this plugin's scope
 - **Send** — it stops being pending, becomes a normal conversation, and moves to the top by send time
 
 ## Behaviour notes
@@ -43,6 +43,14 @@ Restart dsh once after installing (the host half loads at startup).
 
 Disable or remove it in the plugin manager. Existing conversations and archived records are not affected; the sidebar returns to its native look.
 
+> [!NOTE]
+> Uninstalling does **not** wipe the data the plugin left in your browser — reinstall it and everything is picked up again. To clear it for good, delete these keys by hand:
+>
+> - `dsh.pending-session.registry.v1`, `dsh.pending-session.names.v1` — the pending entries and the name/creation-time ledger
+> - `dsh.pending-session.active.v1` — the draft text of the session that was active when you quit; `dsh.conversation.<session-id>` — native draft keys whose `draft` field we rewrote
+> - `dsh.pending-session.journal.v1` — the diagnostic journal; `dsh.pending-session.owner.v1`, `dsh.pending-session.build` — ownership token and build probe
+> - the IndexedDB database `dsh-pending-session` (store `attachments`) — the attachment bytes
+
 ## Safety and data
 
 The plugin adds a **Delete conversation** item to every session row's “…” menu, and that delete is permanent (session log, projection cache and workspace accounting are all removed):
@@ -50,14 +58,17 @@ The plugin adds a **Delete conversation** item to every session row's “…” 
 - A session whose agent is still running cannot be deleted
 - Archive and delete are different things: archiving only hides the session and is reversible
 - Clearing a draft back to blank and leaving removes the entry (archived only, no data loss)
+- **Attachments over 64MB are not cached locally** — the entry is still created and the banner says “⚠️ {n} attachment(s) too large to save”; reopening the entry restores the other attachments only
 
-Deletion is handled by the plugin's own host endpoint; when that endpoint is unavailable it falls back to the system's native archive.
+Deletion is handled by the plugin's own host endpoint. **When that endpoint is unavailable (for example the plugin was installed but dsh was not restarted) nothing is really deleted — the session is only archived**, and the confirmation dialog says so instead of reporting success; restart dsh and delete again to remove it for real.
+
+The plugin deliberately does **not** touch DSH's sqlite persistent search index (the session-query derived read model: `application_id=1146308689`, `user_version=8`, tables `persisted_sessions` plus the fts5 `persisted_docs`). That index is rebuilt from the session logs, so removing the logs is enough for DSH to converge on its own; if DSH ever turns it into authoritative storage, the delete path must clean it up explicitly.
 
 ## Development
 
 ```
 client.js          browser half (UI, draft mirror, sidebar projection, delete flow)
-index.js           host half (delete endpoint: session storage + workspace accounting)
+index.js           host half (delete endpoint: session dirs + projection cache + workspace accounting)
 cordis.patch.yml   bundle row declaration
 tests/sim.mjs      simulation tests
 ```
