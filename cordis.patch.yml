@@ -1,0 +1,11 @@
+# dsh-pending-session 的 bundle patch 层。
+# package.json 的 `dsh.bundle.patch` 指向这个文件：DSH 的 loader 会把它插进
+# profile 的组合树（在 bundle 层之后、用户自己的 cordis.patch.yml 之前）。
+#
+# 说明：
+#   - `name` 必须与安装的包名一致，否则 loader 只 warn 然后跳过这一行，
+#     表现就是“插件没生效但不报错”。
+#   - 这里刻意不写 config：全部可调行为都内置，改完刷新页面即生效。
+- insert:
+    - id: dsh-pending-session
+      name: dsh-pending-session

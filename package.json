@@ -1,0 +1,59 @@
+{
+  "name": "dsh-pending-session",
+  "version": "0.1.0",
+  "description": "待执行（Pending Session）：把带草稿的新会话留在侧边栏，点进继续编辑，发送即转正为普通对话。草稿文本与附件本地持久化，重启不丢。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "draft",
+    "pending",
+    "待执行"
+  ],
+  "scripts": {
+    "test": "node tests/sim.mjs"
+  },
+  "license": "MIT",
+  "author": "nvjaasouid",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nvjaasouid/dsh-pending-session.git"
+  },
+  "homepage": "https://github.com/nvjaasouid/dsh-pending-session#readme",
+  "bugs": {
+    "url": "https://github.com/nvjaasouid/dsh-pending-session/issues"
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-session"
+      ],
+      "external": []
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
